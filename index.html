@@ -1,96 +1,303 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Line Follower Bot</title>
-    <style>
-        body { font-family: Arial; text-align: center; background: #222; color: #fff; }
-        video, canvas { border: 2px solid #fff; margin: 10px; }
-    </style>
+  <meta charset="utf-8" />
+  <title>Line Follower (Phone PID → ESP32 over BLE)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; font-family: system-ui, Arial, sans-serif; background:#0f1115; color:#eaeef2; }
+    header { padding: 14px 16px; display:flex; gap:12px; align-items:center; border-bottom:1px solid #1f2430; }
+    header h1 { font-size: 18px; margin:0; font-weight:600; }
+    .btn { background:#365cff; border:0; color:#fff; padding:8px 12px; border-radius:10px; cursor:pointer; }
+    .btn:disabled { opacity:.5; cursor:not-allowed; }
+    .wrap { padding:16px; display:grid; grid-template-columns: 1fr 1fr; gap:16px; }
+    .panel { background:#131722; border:1px solid #1f2430; border-radius:14px; padding:12px; }
+    .panel h3 { margin:0 0 8px 0; font-size:14px; opacity:.9; }
+    video, canvas { width:100%; aspect-ratio: 4/3; background:#000; border-radius:10px; }
+    .grid { display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap:12px; }
+    .row { display:flex; align-items:center; gap:8px; margin:6px 0; flex-wrap:wrap; }
+    .badge { display:inline-block; padding:3px 8px; border-radius:999px; background:#0f131c; border:1px solid #1f2430; }
+    input[type="range"] { width: 160px; }
+    .tiny { opacity:.8; font-size:12px }
+  </style>
 </head>
 <body>
-    <h1>Line Follower Bot</h1>
-    <video id="video" width="320" height="240" autoplay></video>
-    <canvas id="processed" width="320" height="240"></canvas>
-    <p id="status">Status: Not Connected</p>
+  <header>
+    <h1>Line Follower (Phone PID → ESP32 over BLE)</h1>
+    <button id="btnConnect" class="btn">Connect ESP32</button>
+    <span id="status" class="badge">Idle</span>
+  </header>
 
-    <script>
-    const video = document.getElementById('video');
-    const canvas = document.getElementById('processed');
-    const ctx = canvas.getContext('2d');
-    const status = document.getElementById('status');
+  <div class="wrap">
+    <div class="panel">
+      <h3>Original Camera</h3>
+      <video id="video" autoplay playsinline muted></video>
+    </div>
+    <div class="panel">
+      <h3>Processed Feed (ROI + threshold + centroid)</h3>
+      <canvas id="proc" width="320" height="240"></canvas>
+    </div>
 
-    // PID constants
-    const Kp = 0.5, Ki = 0.0, Kd = 0.1;
-    let prevError = 0, integral = 0;
+    <div class="panel">
+      <h3>Controls</h3>
+      <div class="row">
+        <label><input type="checkbox" id="auto" checked> Auto (PID)</label>
+        <label><input type="checkbox" id="sendPwm" checked> Send raw PWM (else F/L/R)</label>
+        <button class="btn" id="btnStart">Start</button>
+        <button class="btn" id="btnStop">Stop</button>
+      </div>
+      <div class="grid">
+        <div>
+          <div class="row">
+            <span>Base speed</span>
+            <input type="range" min="60" max="255" value="150" id="base">
+            <span id="baseV" class="badge">150</span>
+          </div>
+          <div class="row">
+            <span>Kp</span>
+            <input type="range" min="0" max="2" step="0.01" value="0.60" id="kp">
+            <span id="kpV" class="badge">0.60</span>
+          </div>
+          <div class="row">
+            <span>Ki</span>
+            <input type="range" min="0" max="0.3" step="0.001" value="0.000" id="ki">
+            <span id="kiV" class="badge">0.000</span>
+          </div>
+          <div class="row">
+            <span>Kd</span>
+            <input type="range" min="0" max="1.5" step="0.01" value="0.12" id="kd">
+            <span id="kdV" class="badge">0.12</span>
+          </div>
+        </div>
+        <div>
+          <div class="row">
+            <span>Threshold</span>
+            <input type="range" min="0" max="200" value="60" id="th">
+            <span id="thV" class="badge">60</span>
+          </div>
+          <div class="row">
+            <span>ROI height</span>
+            <input type="range" min="30" max="240" value="80" id="roiH">
+            <span id="roiHV" class="badge">80</span>
+          </div>
+          <div class="row">
+            <span>Send interval (ms)</span>
+            <input type="range" min="10" max="100" value="35" id="intv">
+            <span id="intvV" class="badge">35</span>
+          </div>
+          <div class="row tiny">
+            <span>Tip: if BLE complains "GATT in progress", raise interval to 50–80ms.</span>
+          </div>
+        </div>
+      </div>
+      <div class="row">
+        <button class="btn" data-cmd="F">Fwd</button>
+        <button class="btn" data-cmd="L">Left</button>
+        <button class="btn" data-cmd="R">Right</button>
+        <button class="btn" data-cmd="B">Back</button>
+        <button class="btn" data-cmd="S">Stop</button>
+        <span id="lastCmd" class="badge">—</span>
+        <span id="lastPwm" class="badge">—</span>
+      </div>
+    </div>
 
-    // ESP32 Wi-Fi IP (ESP32 SoftAP default: 192.168.4.1)
-    const ESP32_IP = "192.168.4.1";
-    const ESP32_PORT = 80;
+    <div class="panel">
+      <h3>Debug</h3>
+      <div class="row">
+        <span class="badge" id="dbg">cx=— err=— steer=—</span>
+      </div>
+    </div>
+  </div>
 
-    // Request camera access
-    navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } })
-    .then(stream => video.srcObject = stream)
-    .catch(err => console.error("Camera error:", err));
+<script>
+/* ====== Camera setup ====== */
+const video = document.getElementById('video');
+const proc = document.getElementById('proc');
+const ctx = proc.getContext('2d', { willReadFrequently: true });
 
-    // Process each frame
-    function processFrame() {
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const data = frame.data;
+navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } } })
+  .then(s => { video.srcObject = s; })
+  .catch(e => { setStatus('Camera error: ' + e); });
 
-        let sumX = 0, count = 0;
+/* ====== UI ====== */
+const autoEl = document.getElementById('auto');
+const sendPwmEl = document.getElementById('sendPwm');
+const baseEl = document.getElementById('base'), baseV = document.getElementById('baseV');
+const kpEl = document.getElementById('kp'), kpV = document.getElementById('kpV');
+const kiEl = document.getElementById('ki'), kiV = document.getElementById('kiV');
+const kdEl = document.getElementById('kd'), kdV = document.getElementById('kdV');
+const thEl = document.getElementById('th'), thV = document.getElementById('thV');
+const roiHEl = document.getElementById('roiH'), roiHV = document.getElementById('roiHV');
+const intvEl = document.getElementById('intv'), intvV = document.getElementById('intvV');
+const btnStart = document.getElementById('btnStart');
+const btnStop = document.getElementById('btnStop');
+const lastCmd = document.getElementById('lastCmd');
+const lastPwm = document.getElementById('lastPwm');
+const statusEl = document.getElementById('status');
+const dbg = document.getElementById('dbg');
 
-        for (let y = 180; y < 240; y++) { // bottom 1/4 of frame
-            for (let x = 0; x < 320; x++) {
-                const i = (y * 320 + x) * 4;
-                const r = data[i], g = data[i+1], b = data[i+2];
-                const gray = 0.299*r + 0.587*g + 0.114*b;
+function upd() {
+  baseV.textContent = baseEl.value;
+  kpV.textContent = (+kpEl.value).toFixed(2);
+  kiV.textContent = (+kiEl.value).toFixed(3);
+  kdV.textContent = (+kdEl.value).toFixed(2);
+  thV.textContent = thEl.value;
+  roiHV.textContent = roiHEl.value;
+  intvV.textContent = intvEl.value;
+}
+['input','change'].forEach(ev=>[baseEl,kpEl,kiEl,kdEl,thEl,roiHEl,intvEl].forEach(x=>x.addEventListener(ev,upd))); upd();
 
-                if (gray < 60) { // black line threshold
-                    sumX += x;
-                    count++;
-                    // mark detected pixels in red
-                    data[i] = 255; data[i+1] = 0; data[i+2] = 0;
-                }
-            }
-        }
+function setStatus(t){ statusEl.textContent = t; }
 
-        ctx.putImageData(frame, 0, 0);
-        return count > 0 ? sumX / count : 160; // center
+/* ====== Web Bluetooth (NUS-like) ======
+   Service UUID and characteristic UUID below must match ESP32 code.
+   We use Nordic UART Service (NUS) UUIDs by default.
+*/
+const SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const CHAR_UUID    = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // write
+
+let device, server, txChar;
+let canSend = true; // simple gate to avoid overlapping writes
+let run = false;    // main loop flag
+
+document.getElementById('btnConnect').addEventListener('click', async () => {
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'ESP32_LF' }],
+      optionalServices: [SERVICE_UUID]
+    });
+    server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(SERVICE_UUID);
+    txChar = await svc.getCharacteristic(CHAR_UUID);
+    setStatus('BLE connected');
+  } catch (e) {
+    setStatus('BLE error: ' + e);
+  }
+});
+
+btnStart.addEventListener('click', ()=> { run = true; setStatus('Running'); });
+btnStop .addEventListener('click', ()=> { run = false; sendCmd('S'); setStatus('Stopped'); });
+
+document.querySelectorAll('[data-cmd]').forEach(b=>{
+  b.addEventListener('click', ()=> sendCmd(b.dataset.cmd));
+});
+
+/* ====== BLE send helpers ====== */
+async function writeBytes(u8) {
+  if (!txChar || !canSend) return;
+  canSend = false;
+  try { await txChar.writeValue(u8); } catch(e) {} finally { canSend = true; }
+}
+
+function sendCmd(c) {
+  lastCmd.textContent = c;
+  const u8 = new Uint8Array([c.charCodeAt(0)]);
+  writeBytes(u8);
+}
+
+function sendPWM(l, r) {
+  const u8 = new Uint8Array([l & 0xff, r & 0xff]); // 0..255
+  lastPwm.textContent = `${l}|${r}`;
+  writeBytes(u8);
+}
+
+/* ====== Vision + PID ====== */
+let prevErr = 0, integ = 0;
+let lastSend = 0;
+
+function processFrame() {
+  // draw video into canvas
+  const W = proc.width, H = proc.height;
+  ctx.drawImage(video, 0, 0, W, H);
+
+  const img = ctx.getImageData(0, 0, W, H);
+  const d = img.data;
+
+  const roiH = +roiHEl.value;          // pixels from bottom
+  const th = +thEl.value;              // grayscale threshold for black
+  const y0 = H - roiH;
+
+  let sumX = 0, cnt = 0;
+
+  for (let y = y0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = (y*W + x) * 4;
+      const gray = 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2];
+      if (gray < th) {
+        sumX += x; cnt++;
+        // mark detected pixel red
+        d[i] = 255; d[i+1] = 0; d[i+2] = 0;
+      }
     }
+  }
 
-    // PID and motor speed calculation
-    function computeMotorSpeeds(cx) {
-        const error = cx - 160;
-        integral += error;
-        const derivative = error - prevError;
-        prevError = error;
-        const steering = Kp*error + Ki*integral + Kd*derivative;
+  // overlay ROI guide
+  for (let x=0; x<W; x++) {
+    const j = (y0*W + x) * 4;
+    d[j] = 0; d[j+1] = 255; d[j+2] = 0; // green line at ROI top
+  }
 
-        let left = Math.max(0, Math.min(255, 150 - steering));
-        let right = Math.max(0, Math.min(255, 150 + steering));
-        return {left, right};
+  let cx = W/2;
+  let seen = false;
+  if (cnt > 30) { // require enough pixels
+    cx = sumX / cnt; seen = true;
+    // draw centroid line
+    for (let y = y0; y < H; y++) {
+      const i = (y*W + Math.floor(cx)) * 4;
+      d[i] = 0; d[i+1] = 255; d[i+2] = 255; // cyan center of mass
     }
+  }
 
-    // Send motor speeds to ESP32 via HTTP GET
-    async function sendMotorCommand(left, right) {
-        const url = `http://${ESP32_IP}:${ESP32_PORT}/set_motors?left=${Math.floor(left)}&right=${Math.floor(right)}`;
-        try {
-            await fetch(url);
-        } catch(e) {
-            console.error("HTTP send error:", e);
-        }
+  ctx.putImageData(img, 0, 0);
+  return { cx, seen, W };
+}
+
+function step() {
+  if (!run) { requestAnimationFrame(step); return; }
+
+  const { cx, seen, W } = processFrame();
+
+  // PID
+  const base = +baseEl.value;
+  const Kp = +kpEl.value, Ki = +kiEl.value, Kd = +kdEl.value;
+
+  const err = cx - (W/2);
+  integ += err;
+  const deriv = err - prevErr;
+  prevErr = err;
+
+  const steer = Kp*err + Ki*integ + Kd*deriv;
+
+  // convert to motor PWMs
+  let L = Math.round(Math.max(0, Math.min(255, base - steer)));
+  let R = Math.round(Math.max(0, Math.min(255, base + steer)));
+
+  dbg.textContent = `cx=${cx.toFixed(1)} err=${err.toFixed(1)} steer=${steer.toFixed(1)} L=${L} R=${R}`;
+
+  const now = performance.now();
+  const interval = +intvEl.value;
+
+  if (txChar && (now - lastSend >= interval)) {
+    if (!seen) {
+      sendCmd('S'); // lost line → stop (or you could try B)
+    } else if (sendPwmEl.checked) {
+      sendPWM(L, R);
+    } else {
+      // high-level: choose F/L/R by steer
+      const thr = 8; // steer threshold
+      if (steer > thr) sendCmd('R');
+      else if (steer < -thr) sendCmd('L');
+      else sendCmd('F');
     }
+    lastSend = now;
+  }
 
-    // Main loop
-    function loop() {
-        const cx = processFrame();
-        const speeds = computeMotorSpeeds(cx);
-        sendMotorCommand(speeds.left, speeds.right);
-        requestAnimationFrame(loop);
-    }
+  requestAnimationFrame(step);
+}
 
-    loop();
-    </script>
+// start loop
+requestAnimationFrame(step);
+</script>
 </body>
 </html>
