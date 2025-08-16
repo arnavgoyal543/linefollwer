@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Line Follower Bot</title>
+    <style>
+        body { font-family: Arial; text-align: center; background: #222; color: #fff; }
+        video, canvas { border: 2px solid #fff; margin: 10px; }
+    </style>
+</head>
+<body>
+    <h1>Line Follower Bot</h1>
+    <video id="video" width="320" height="240" autoplay></video>
+    <canvas id="processed" width="320" height="240"></canvas>
+    <button id="connect">Connect to ESP32</button>
+    <p id="status">Status: Not Connected</p>
+
+    <script>
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('processed');
+    const ctx = canvas.getContext('2d');
+    const status = document.getElementById('status');
+    const connectBtn = document.getElementById('connect');
+
+    let bluetoothDevice, bluetoothServer, bluetoothCharacteristic;
+
+    // PID constants
+    const Kp = 0.5, Ki = 0.0, Kd = 0.1;
+    let prevError = 0, integral = 0;
+
+    // Request camera access
+    navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } })
+    .then(stream => video.srcObject = stream)
+    .catch(err => console.error("Camera error:", err));
+
+    // Connect to ESP32 via Bluetooth
+    connectBtn.onclick = async () => {
+        try {
+            bluetoothDevice = await navigator.bluetooth.requestDevice({
+                filters: [{ namePrefix: 'ESP32' }],
+                optionalServices: [0xFFE0]  // replace with your service UUID
+            });
+            bluetoothServer = await bluetoothDevice.gatt.connect();
+            const service = await bluetoothServer.getPrimaryService(0xFFE0);
+            bluetoothCharacteristic = await service.getCharacteristic(0xFFE1); // replace with your characteristic UUID
+            status.innerText = "Status: Connected";
+        } catch (e) {
+            console.error(e);
+            status.innerText = "Status: Connection Failed";
+        }
+    };
+
+    // Process each frame
+    function processFrame() {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const data = frame.data;
+
+        let sumX = 0, count = 0;
+
+        for (let y = 180; y < 240; y++) { // bottom 1/4 of frame
+            for (let x = 0; x < 320; x++) {
+                const i = (y * 320 + x) * 4;
+                const r = data[i], g = data[i+1], b = data[i+2];
+                const gray = 0.299*r + 0.587*g + 0.114*b;
+
+                if (gray < 60) { // black line threshold
+                    sumX += x;
+                    count++;
+                    // mark detected pixels in red
+                    data[i] = 255; data[i+1] = 0; data[i+2] = 0;
+                }
+            }
+        }
+
+        ctx.putImageData(frame, 0, 0);
+
+        const cx = count > 0 ? sumX / count : 160; // default to center if no line
+        return cx;
+    }
+
+    // PID and motor speed calculation
+    function computeMotorSpeeds(cx) {
+        const error = cx - 160;
+        integral += error;
+        const derivative = error - prevError;
+        prevError = error;
+        const steering = Kp*error + Ki*integral + Kd*derivative;
+
+        let left = Math.max(0, Math.min(255, 150 - steering));
+        let right = Math.max(0, Math.min(255, 150 + steering));
+        return {left, right};
+    }
+
+    // Send motor speeds to ESP32 via Bluetooth
+    async function sendMotorCommand(left, right) {
+        if (!bluetoothCharacteristic) return;
+        const buffer = new Uint8Array([left, right]);
+        try {
+            await bluetoothCharacteristic.writeValue(buffer);
+        } catch(e) {
+            console.error("Bluetooth send error:", e);
+        }
+    }
+
+    // Main loop
+    function loop() {
+        const cx = processFrame();
+        const speeds = computeMotorSpeeds(cx);
+        sendMotorCommand(Math.floor(speeds.left), Math.floor(speeds.right));
+        requestAnimationFrame(loop);
+    }
+
+    loop();
+    </script>
+</body>
+</html>
