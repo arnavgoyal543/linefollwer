@@ -11,7 +11,6 @@
     <h1>Line Follower Bot</h1>
     <video id="video" width="320" height="240" autoplay></video>
     <canvas id="processed" width="320" height="240"></canvas>
-    <button id="connect">Connect to ESP32</button>
     <p id="status">Status: Not Connected</p>
 
     <script>
@@ -19,35 +18,19 @@
     const canvas = document.getElementById('processed');
     const ctx = canvas.getContext('2d');
     const status = document.getElementById('status');
-    const connectBtn = document.getElementById('connect');
-
-    let bluetoothDevice, bluetoothServer, bluetoothCharacteristic;
 
     // PID constants
     const Kp = 0.5, Ki = 0.0, Kd = 0.1;
     let prevError = 0, integral = 0;
 
+    // ESP32 Wi-Fi IP (ESP32 SoftAP default: 192.168.4.1)
+    const ESP32_IP = "192.168.4.1";
+    const ESP32_PORT = 80;
+
     // Request camera access
     navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } })
     .then(stream => video.srcObject = stream)
     .catch(err => console.error("Camera error:", err));
-
-    // Connect to ESP32 via Bluetooth
-    connectBtn.onclick = async () => {
-        try {
-            bluetoothDevice = await navigator.bluetooth.requestDevice({
-                filters: [{ namePrefix: 'ESP32' }],
-                optionalServices: [0xFFE0]  // replace with your service UUID
-            });
-            bluetoothServer = await bluetoothDevice.gatt.connect();
-            const service = await bluetoothServer.getPrimaryService(0xFFE0);
-            bluetoothCharacteristic = await service.getCharacteristic(0xFFE1); // replace with your characteristic UUID
-            status.innerText = "Status: Connected";
-        } catch (e) {
-            console.error(e);
-            status.innerText = "Status: Connection Failed";
-        }
-    };
 
     // Process each frame
     function processFrame() {
@@ -73,9 +56,7 @@
         }
 
         ctx.putImageData(frame, 0, 0);
-
-        const cx = count > 0 ? sumX / count : 160; // default to center if no line
-        return cx;
+        return count > 0 ? sumX / count : 160; // center
     }
 
     // PID and motor speed calculation
@@ -91,31 +72,25 @@
         return {left, right};
     }
 
-    // Send motor speeds to ESP32 via Bluetooth
-   async function sendCommand(cmd) {
-    if (!bluetoothCharacteristic) return;
-    let value;
-    if (cmd.length === 1) {
-        value = new Uint8Array([cmd.charCodeAt(0)]);
-    } else {
-        value = new Uint8Array(cmd); // array of [left,right]
+    // Send motor speeds to ESP32 via HTTP GET
+    async function sendMotorCommand(left, right) {
+        const url = `http://${ESP32_IP}:${ESP32_PORT}/set_motors?left=${Math.floor(left)}&right=${Math.floor(right)}`;
+        try {
+            await fetch(url);
+        } catch(e) {
+            console.error("HTTP send error:", e);
+        }
     }
-    try {
-        await bluetoothCharacteristic.writeValue(value);
-    } catch(e) {
-        console.error(e);
-    }
-}
+
     // Main loop
     function loop() {
         const cx = processFrame();
         const speeds = computeMotorSpeeds(cx);
-        sendMotorCommand(Math.floor(speeds.left), Math.floor(speeds.right));
+        sendMotorCommand(speeds.left, speeds.right);
         requestAnimationFrame(loop);
     }
 
     loop();
     </script>
 </body>
-
 </html>
