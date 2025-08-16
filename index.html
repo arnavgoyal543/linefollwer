@@ -35,7 +35,7 @@
       <video id="video" autoplay playsinline muted></video>
     </div>
     <div class="panel">
-      <h3>Processed Feed (ROI + threshold + centroid)</h3>
+      <h3>Processed Feed (Adaptive + Morphology)</h3>
       <canvas id="proc" width="320" height="240"></canvas>
     </div>
 
@@ -72,9 +72,14 @@
         </div>
         <div>
           <div class="row">
-            <span>Threshold</span>
-            <input type="range" min="0" max="200" value="60" id="th">
-            <span id="thV" class="badge">60</span>
+            <span>Adaptive factor</span>
+            <input type="range" min="30" max="90" value="60" id="af">
+            <span id="afV" class="badge">60%</span>
+          </div>
+          <div class="row">
+            <span>Absolute V cutoff</span>
+            <input type="range" min="0" max="255" value="60" id="vcut">
+            <span id="vcutV" class="badge">60</span>
           </div>
           <div class="row">
             <span>ROI height</span>
@@ -82,12 +87,15 @@
             <span id="roiHV" class="badge">80</span>
           </div>
           <div class="row">
+            <label><input type="checkbox" id="morph" checked> Use morphology (3×3 opening)</label>
+          </div>
+          <div class="row">
             <span>Send interval (ms)</span>
             <input type="range" min="10" max="100" value="35" id="intv">
             <span id="intvV" class="badge">35</span>
           </div>
           <div class="row tiny">
-            <span>Tip: if BLE complains "GATT in progress", raise interval to 50–80ms.</span>
+            <span>Tip: raise interval if BLE write errors occur (50–80ms).</span>
           </div>
         </div>
       </div>
@@ -127,9 +135,11 @@ const baseEl = document.getElementById('base'), baseV = document.getElementById(
 const kpEl = document.getElementById('kp'), kpV = document.getElementById('kpV');
 const kiEl = document.getElementById('ki'), kiV = document.getElementById('kiV');
 const kdEl = document.getElementById('kd'), kdV = document.getElementById('kdV');
-const thEl = document.getElementById('th'), thV = document.getElementById('thV');
+const afEl = document.getElementById('af'), afV = document.getElementById('afV');
+const vcutEl = document.getElementById('vcut'), vcutV = document.getElementById('vcutV');
 const roiHEl = document.getElementById('roiH'), roiHV = document.getElementById('roiHV');
 const intvEl = document.getElementById('intv'), intvV = document.getElementById('intvV');
+const morphEl = document.getElementById('morph');
 const btnStart = document.getElementById('btnStart');
 const btnStop = document.getElementById('btnStop');
 const lastCmd = document.getElementById('lastCmd');
@@ -142,24 +152,22 @@ function upd() {
   kpV.textContent = (+kpEl.value).toFixed(2);
   kiV.textContent = (+kiEl.value).toFixed(3);
   kdV.textContent = (+kdEl.value).toFixed(2);
-  thV.textContent = thEl.value;
+  afV.textContent = ( +afEl.value ).toString() + "%";
+  vcutV.textContent = vcutEl.value;
   roiHV.textContent = roiHEl.value;
   intvV.textContent = intvEl.value;
 }
-['input','change'].forEach(ev=>[baseEl,kpEl,kiEl,kdEl,thEl,roiHEl,intvEl].forEach(x=>x.addEventListener(ev,upd))); upd();
+['input','change'].forEach(ev=>[baseEl,kpEl,kiEl,kdEl,afEl,vcutEl,roiHEl,intvEl].forEach(x=>x.addEventListener(ev,upd))); upd();
 
 function setStatus(t){ statusEl.textContent = t; }
 
-/* ====== Web Bluetooth (NUS-like) ======
-   Service UUID and characteristic UUID below must match ESP32 code.
-   We use Nordic UART Service (NUS) UUIDs by default.
-*/
+/* ====== Web Bluetooth (NUS-like) ====== */
 const SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
-const CHAR_UUID    = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // write
+const CHAR_UUID    = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
 
 let device, server, txChar;
-let canSend = true; // simple gate to avoid overlapping writes
-let run = false;    // main loop flag
+let canSend = true;
+let run = false;
 
 document.getElementById('btnConnect').addEventListener('click', async () => {
   try {
@@ -179,73 +187,144 @@ document.getElementById('btnConnect').addEventListener('click', async () => {
 btnStart.addEventListener('click', ()=> { run = true; setStatus('Running'); });
 btnStop .addEventListener('click', ()=> { run = false; sendCmd('S'); setStatus('Stopped'); });
 
-document.querySelectorAll('[data-cmd]').forEach(b=>{
-  b.addEventListener('click', ()=> sendCmd(b.dataset.cmd));
-});
+document.querySelectorAll('[data-cmd]').forEach(b=>{ b.addEventListener('click', ()=> sendCmd(b.dataset.cmd)); });
 
 /* ====== BLE send helpers ====== */
 async function writeBytes(u8) {
   if (!txChar || !canSend) return;
   canSend = false;
-  try { await txChar.writeValue(u8); } catch(e) {} finally { canSend = true; }
+  try { await txChar.writeValue(u8); } catch(e) { console.warn('BLE write err', e); } finally { canSend = true; }
 }
-
 function sendCmd(c) {
   lastCmd.textContent = c;
   const u8 = new Uint8Array([c.charCodeAt(0)]);
   writeBytes(u8);
 }
-
 function sendPWM(l, r) {
-  const u8 = new Uint8Array([l & 0xff, r & 0xff]); // 0..255
+  const u8 = new Uint8Array([l & 0xff, r & 0xff]);
   lastPwm.textContent = `${l}|${r}`;
   writeBytes(u8);
 }
 
-/* ====== Vision + PID ====== */
+/* ====== Vision + PID (adaptive + morphology) ====== */
 let prevErr = 0, integ = 0;
 let lastSend = 0;
 
+function createMask(W, Hroi) {
+  return new Uint8Array(W * Hroi);
+}
+
+function erode(mask, W, H) {
+  const out = new Uint8Array(W*H);
+  for (let y=1; y<H-1; y++) {
+    for (let x=1; x<W-1; x++) {
+      let sum = 0;
+      for (let oy=-1; oy<=1; oy++) {
+        for (let ox=-1; ox<=1; ox++) {
+          sum += mask[(y+oy)*W + (x+ox)];
+        }
+      }
+      out[y*W + x] = (sum === 9) ? 1 : 0;
+    }
+  }
+  return out;
+}
+function dilate(mask, W, H) {
+  const out = new Uint8Array(W*H);
+  for (let y=0; y<H; y++) {
+    for (let x=0; x<W; x++) {
+      let any = 0;
+      for (let oy=-1; oy<=1; oy++) {
+        for (let ox=-1; ox<=1; ox++) {
+          const yy = y+oy, xx = x+ox;
+          if (yy<0 || yy>=H || xx<0 || xx>=W) continue;
+          if (mask[yy*W + xx]) { any = 1; break; }
+        }
+        if (any) break;
+      }
+      out[y*W + x] = any;
+    }
+  }
+  return out;
+}
+
 function processFrame() {
-  // draw video into canvas
   const W = proc.width, H = proc.height;
   ctx.drawImage(video, 0, 0, W, H);
-
   const img = ctx.getImageData(0, 0, W, H);
   const d = img.data;
 
-  const roiH = +roiHEl.value;          // pixels from bottom
-  const th = +thEl.value;              // grayscale threshold for black
+  const roiH = +roiHEl.value;
   const y0 = H - roiH;
+  const af = (+afEl.value) / 100.0;     // adaptive factor (0.3..0.9)
+  const vcut = +vcutEl.value / 255.0;  // absolute V cutoff 0..1
 
-  let sumX = 0, cnt = 0;
-
+  // 1) compute avg V across ROI
+  let sumV = 0, pixels = 0;
   for (let y = y0; y < H; y++) {
     for (let x = 0; x < W; x++) {
-      const i = (y*W + x) * 4;
-      const gray = 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2];
-      if (gray < th) {
-        sumX += x; cnt++;
-        // mark detected pixel red
-        d[i] = 255; d[i+1] = 0; d[i+2] = 0;
+      const i = (y*W + x)*4;
+      const r = d[i]/255, g = d[i+1]/255, b = d[i+2]/255;
+      const v = Math.max(r,g,b);
+      sumV += v; pixels++;
+    }
+  }
+  const avgV = (pixels>0) ? (sumV / pixels) : 0.4;
+  const threshV = avgV * af; // adaptive threshold based on average
+
+  // 2) build binary mask (1 = candidate line)
+  const Hroi = roiH, Wroi = W;
+  let mask = createMask(Wroi, Hroi);
+  let sumX = 0, cnt = 0;
+  for (let y = 0; y < Hroi; y++) {
+    const yy = y0 + y;
+    for (let x = 0; x < Wroi; x++) {
+      const i = (yy*W + x)*4;
+      const r = d[i]/255, g = d[i+1]/255, b = d[i+2]/255;
+      const v = Math.max(r,g,b);
+      // Mark as line if either: very dark (v < vcut) OR darker than adaptive threshold
+      if (v < vcut || v < threshV) {
+        mask[y*Wroi + x] = 1;
+      } else {
+        mask[y*Wroi + x] = 0;
       }
     }
   }
 
-  // overlay ROI guide
-  for (let x=0; x<W; x++) {
-    const j = (y0*W + x) * 4;
-    d[j] = 0; d[j+1] = 255; d[j+2] = 0; // green line at ROI top
+  // 3) optional morphology (opening = erode then dilate) to remove small shadow blobs
+  if (morphEl.checked) {
+    mask = erode(mask, Wroi, Hroi);
+    mask = dilate(mask, Wroi, Hroi);
   }
 
-  let cx = W/2;
-  let seen = false;
-  if (cnt > 30) { // require enough pixels
-    cx = sumX / cnt; seen = true;
-    // draw centroid line
+  // 4) compute centroid from mask and paint mask onto image
+  for (let y = 0; y < Hroi; y++) {
+    const yy = y0 + y;
+    for (let x = 0; x < Wroi; x++) {
+      const m = mask[y*Wroi + x];
+      if (m) {
+        const i = (yy*W + x)*4;
+        d[i] = 255; d[i+1] = 0; d[i+2] = 0; // red
+        sumX += x; cnt++;
+      }
+    }
+  }
+
+  // overlay ROI top guide line
+  for (let x=0; x<W; x++) {
+    const j = (y0*W + x) * 4;
+    d[j] = 0; d[j+1] = 255; d[j+2] = 0;
+  }
+
+  let cx = W/2, seen = false;
+  if (cnt > 20) {
+    cx = sumX / cnt;
+    seen = true;
+    // draw centroid column
+    const colX = Math.floor(cx);
     for (let y = y0; y < H; y++) {
-      const i = (y*W + Math.floor(cx)) * 4;
-      d[i] = 0; d[i+1] = 255; d[i+2] = 255; // cyan center of mass
+      const ii = (y*W + colX) * 4;
+      d[ii] = 0; d[ii+1] = 255; d[ii+2] = 255; // cyan center
     }
   }
 
@@ -280,12 +359,11 @@ function step() {
 
   if (txChar && (now - lastSend >= interval)) {
     if (!seen) {
-      sendCmd('S'); // lost line → stop (or you could try B)
+      sendCmd('S');
     } else if (sendPwmEl.checked) {
       sendPWM(L, R);
     } else {
-      // high-level: choose F/L/R by steer
-      const thr = 8; // steer threshold
+      const thr = 8;
       if (steer > thr) sendCmd('R');
       else if (steer < -thr) sendCmd('L');
       else sendCmd('F');
@@ -296,7 +374,7 @@ function step() {
   requestAnimationFrame(step);
 }
 
-// start loop
+/* start loop */
 requestAnimationFrame(step);
 </script>
 </body>
