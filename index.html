@@ -92,16 +92,20 @@
     }
 
     // Send motor speeds to ESP32 via Bluetooth
-    async function sendMotorCommand(left, right) {
-        if (!bluetoothCharacteristic) return;
-        const buffer = new Uint8Array([left, right]);
-        try {
-            await bluetoothCharacteristic.writeValue(buffer);
-        } catch(e) {
-            console.error("Bluetooth send error:", e);
-        }
+   async function sendCommand(cmd) {
+    if (!bluetoothCharacteristic) return;
+    let value;
+    if (cmd.length === 1) {
+        value = new Uint8Array([cmd.charCodeAt(0)]);
+    } else {
+        value = new Uint8Array(cmd); // array of [left,right]
     }
-
+    try {
+        await bluetoothCharacteristic.writeValue(value);
+    } catch(e) {
+        console.error(e);
+    }
+}
     // Main loop
     function loop() {
         const cx = processFrame();
@@ -113,4 +117,5 @@
     loop();
     </script>
 </body>
+
 </html>
