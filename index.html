@@ -1,61 +1,134 @@
-from machine import Pin, PWM
-import ubluetooth, struct
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Smart Line Follower</title>
+  <style>
+    body { font-family: Arial; text-align: center; background: #222; color: #fff; }
+    video, canvas { border: 2px solid #fff; margin: 10px; }
+  </style>
+</head>
+<body>
+  <h1>Smart Line Follower Bot</h1>
+  <video id="video" width="320" height="240" autoplay></video>
+  <canvas id="processed" width="320" height="240"></canvas>
+  <button id="connect">Connect to ESP32</button>
+  <p id="status">Status: Not Connected</p>
 
-# Motor pins
-AIN1 = Pin(16, Pin.OUT)
-AIN2 = Pin(17, Pin.OUT)
-PWMA = PWM(Pin(4), freq=1000)
+  <script>
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('processed');
+  const ctx = canvas.getContext('2d');
+  const status = document.getElementById('status');
+  const connectBtn = document.getElementById('connect');
 
-BIN1 = Pin(18, Pin.OUT)
-BIN2 = Pin(19, Pin.OUT)
-PWMB = PWM(Pin(5), freq=1000)
+  let bluetoothDevice, bluetoothServer, bluetoothCharacteristic;
 
-STBY = Pin(23, Pin.OUT)
-STBY.value(1)
+  // PID constants
+  const Kp = 0.5, Ki = 0.0, Kd = 0.2;
+  let prevError = 0, integral = 0;
 
-# BLE setup
-ble = ubluetooth.BLE()
-ble.active(True)
+  // Request camera access
+  navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } })
+  .then(stream => video.srcObject = stream)
+  .catch(err => console.error("Camera error:", err));
 
-UART_UUID = ubluetooth.UUID(0xFFE0)
-TXRX_UUID = ubluetooth.UUID(0xFFE1)
+  // Connect to ESP32 via Bluetooth
+  connectBtn.onclick = async () => {
+      try {
+          bluetoothDevice = await navigator.bluetooth.requestDevice({
+              filters: [{ namePrefix: 'ESP32' }],
+              optionalServices: [0xFFE0]
+          });
+          bluetoothServer = await bluetoothDevice.gatt.connect();
+          const service = await bluetoothServer.getPrimaryService(0xFFE0);
+          bluetoothCharacteristic = await service.getCharacteristic(0xFFE1);
+          status.innerText = "Status: Connected";
+      } catch (e) {
+          console.error(e);
+          status.innerText = "Status: Connection Failed";
+      }
+  };
 
-UART_SERVICE = (
-    UART_UUID,
-    (ubluetooth.FLAG_WRITE | ubluetooth.FLAG_READ,),
-)
+  // Frame processing
+  function processFrame() {
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const data = frame.data;
 
-handle = None
+      let sumX = 0, count = 0;
+      let leftCount = 0, rightCount = 0;
 
-def motor_control(m1, m2):
-    # Motor A
-    if m1 > 0:
-        AIN1.value(1); AIN2.value(0)
-    elif m1 < 0:
-        AIN1.value(0); AIN2.value(1)
-    else:
-        AIN1.value(0); AIN2.value(0)
-    PWMA.duty(abs(m1))
+      // Bottom half of the frame
+      for (let y = 160; y < 240; y++) {
+          for (let x = 0; x < 320; x++) {
+              const i = (y * 320 + x) * 4;
+              const r = data[i], g = data[i+1], b = data[i+2];
+              const gray = 0.299*r + 0.587*g + 0.114*b;
 
-    # Motor B
-    if m2 > 0:
-        BIN1.value(1); BIN2.value(0)
-    elif m2 < 0:
-        BIN1.value(0); BIN2.value(1)
-    else:
-        BIN1.value(0); BIN2.value(0)
-    PWMB.duty(abs(m2))
+              // Adaptive threshold
+              if (gray < 80) {
+                  sumX += x;
+                  count++;
+                  if (x < 160) leftCount++;
+                  else rightCount++;
+                  data[i] = 255; data[i+1] = 0; data[i+2] = 0; // mark red
+              }
+          }
+      }
 
-def bt_irq(event, data):
-    global handle
-    if event == 1:  # Central connected
-        handle = data[0]
-    elif event == 3:  # Write event
-        buffer = ble.gatts_read(data[1])
-        if len(buffer) == 2:
-            m1, m2 = buffer[0], buffer[1]
-            motor_control(m1, m2)
+      ctx.putImageData(frame, 0, 0);
 
-ble.irq(bt_irq)
-((handle,),) = ble.gatts_register_services((UART_SERVICE,))
-ble.gap_advertise(100, b'\x02\x01\x06\x03\x03\xe0\xff\x0b\x09ESP32Bot')
+      // Default = center
+      const cx = count > 0 ? sumX / count : 160;
+      return { cx, leftCount, rightCount, count };
+  }
+
+  function computeDecision(line) {
+      const error = line.cx - 160;
+      integral += error;
+      const derivative = error - prevError;
+      prevError = error;
+      const steering = Kp*error + Ki*integral + Kd*derivative;
+
+      let left = Math.max(0, Math.min(255, 150 - steering));
+      let right = Math.max(0, Math.min(255, 150 + steering));
+
+      // ---- SMART DECISIONS ----
+      if (line.count < 20) {
+          // Lost line: stop
+          left = 0; right = 0;
+      } else if (line.leftCount > 2000 && line.rightCount < 200) {
+          // Strong left signal → 90° left
+          left = 100; right = 200;
+      } else if (line.rightCount > 2000 && line.leftCount < 200) {
+          // Strong right signal → 90° right
+          left = 200; right = 100;
+      } else if (line.leftCount > 1000 && line.rightCount > 1000) {
+          // Both sides strong → intersection
+          left = 200; right = 200; // go straight (can change to stop or turn)
+      }
+
+      return {left, right};
+  }
+
+  async function sendMotorCommand(left, right) {
+      if (!bluetoothCharacteristic) return;
+      const buffer = new Uint8Array([left, right]);
+      try {
+          await bluetoothCharacteristic.writeValue(buffer);
+      } catch(e) {
+          console.error("Bluetooth send error:", e);
+      }
+  }
+
+  function loop() {
+      const line = processFrame();
+      const speeds = computeDecision(line);
+      sendMotorCommand(Math.floor(speeds.left), Math.floor(speeds.right));
+      requestAnimationFrame(loop);
+  }
+
+  loop();
+  </script>
+</body>
+</html>
